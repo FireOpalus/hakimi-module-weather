@@ -1,4 +1,4 @@
-"""Hourly weather integration."""
+"""On-demand weather integration."""
 
 from hakimi.modules.weather import WeatherModule
 

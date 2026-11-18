@@ -20,6 +20,15 @@ class WeatherCityQuery(BaseModel):
     query: str = Field(min_length=2, max_length=80)
 
 
+@router.get("/current")
+async def current_weather(request: Request):
+    result = await service(request).life_engine.query("weather.read")
+    if result.status != "done":
+        status = 503 if result.reason in {"weather_unavailable", "weather_stale"} else 409
+        raise HTTPException(status, result.reason)
+    return result.details
+
+
 @router.post("/location/cities")
 async def weather_cities(request: Request):
     query = await body(request, WeatherCityQuery)

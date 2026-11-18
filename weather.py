@@ -10,10 +10,42 @@ from zoneinfo import ZoneInfo
 import httpx
 from pydantic import BaseModel, Field
 
-from .actions import Action, ActionCall, DailyAction, HourlyAction, Outcome
+from ..http_json import bounded_json
+from ..security import Rejected
+from .actions import Action, ActionCall, Outcome
 from .base import BaseModule
-from .scheduling import ScheduleOptions, ScheduleTime
 from .weather_location import Coordinates, WeatherLocation
+
+CONDITIONS = {
+    0: "晴",
+    1: "大部晴朗",
+    2: "局部多云",
+    3: "阴",
+    45: "雾",
+    48: "雾凇",
+    51: "小毛毛雨",
+    53: "毛毛雨",
+    55: "较强毛毛雨",
+    56: "轻微冻毛毛雨",
+    57: "较强冻毛毛雨",
+    61: "小雨",
+    63: "中雨",
+    65: "大雨",
+    66: "轻微冻雨",
+    67: "强冻雨",
+    71: "小雪",
+    73: "中雪",
+    75: "大雪",
+    77: "米雪",
+    80: "小阵雨",
+    81: "阵雨",
+    82: "强阵雨",
+    85: "小阵雪",
+    86: "强阵雪",
+    95: "雷暴",
+    96: "雷暴伴轻微冰雹",
+    99: "雷暴伴强冰雹",
+}
 
 
 class Observation(BaseModel):
@@ -25,20 +57,20 @@ class Observation(BaseModel):
     shortwave_radiation: float | None = Field(None, ge=0, strict=True, allow_inf_nan=False)
     is_day: int | None = Field(None, strict=True, ge=0, le=1)
 
+    def fresh_at(self, now: float) -> bool:
+        return self.time <= now < self.time + self.interval
 
-class WeatherScheduleOptions(ScheduleOptions):
-    observation_time: ScheduleTime = Field("09:30", title="每日 Owner 天气提醒时间（HH:MM）")
-
-    @classmethod
-    def from_settings(cls, settings):
-        return cls(observation_time=settings.weather_time)
+    def describe(self, zone: str) -> str:
+        at = datetime.fromtimestamp(self.time, ZoneInfo(zone))
+        condition = CONDITIONS.get(self.weather_code, f"天气代码 {self.weather_code}")
+        rain = f"，时段降水 {self.precipitation:g} 毫米" if self.precipitation is not None else ""
+        return f"{at:%m-%d %H:%M}，{condition}，{self.temperature_2m:g} °C{rain}"
 
 
 class WeatherModule(BaseModule):
     module_id = "weather"
     display_name = "天气观测"
-    description = "观测地点、每小时天气与每日提醒"
-    schedule_options = WeatherScheduleOptions
+    description = "AI 和其他模块可按需查询已设地点的当前天气"
     current_fields = "temperature_2m,weather_code,precipitation,shortwave_radiation,is_day"
 
     def __init__(self, settings, http, world):
@@ -54,6 +86,7 @@ class WeatherModule(BaseModule):
         self._override: WeatherLocation | None = None
         self._revision = 0
         self._location_lock = asyncio.Lock()
+        self._read_lock = asyncio.Lock()
 
     @property
     def location(self) -> Coordinates | None:
@@ -83,6 +116,17 @@ class WeatherModule(BaseModule):
     @asynccontextmanager
     async def lifespan(self):
         await self.load_location()
+        # Older releases could already have queued a timer or its separate QQ reminder.
+        async with self.world.store.transaction():
+            await self.world.store.db.execute(
+                "UPDATE scheduled_intents SET status='gated_skip', "
+                "result_reason='weather_schedule_retired',updated_at=? WHERE "
+                "(status='pending' OR (status='executing' AND handler_started=0)) AND "
+                "((origin='timer' AND action_name IN ('weather.read','weather.daily_report')) "
+                "OR id IN (SELECT intent_id FROM life_rule_receipts "
+                "WHERE rule_id='weather.owner_report'))",
+                (self.world.clock(),),
+            )
         yield
 
     async def set_location(self, place: WeatherLocation | None) -> None:
@@ -108,28 +152,9 @@ class WeatherModule(BaseModule):
         return (
             Action(
                 name="weather.read",
-                description="每小时读取配置地点的当前天气",
-                origins=frozenset({"timer"}),
+                description="按需查询已设地点（你那边）的当前天气、气温与降水。仅用于当地实况，不提供异地或未来预报。",
+                origins=frozenset({"planner", "query"}),
                 run=self.read,
-                background_sensor=True,
-            ),
-            Action(
-                name="weather.daily_report",
-                description="用最近一次天气观测准备每日 Owner 提醒",
-                origins=frozenset({"timer"}),
-                run=self.daily_report,
-            ),
-        )
-
-    def schedules(self):
-        return (
-            HourlyAction("weather.read", label="天气采样"),
-            DailyAction(
-                "weather.daily_report",
-                self.settings.weather_time,
-                label="Owner 天气提醒",
-                time_option="observation_time",
-                enabled=lambda: self.settings.weather_owner_report,
             ),
         )
 
@@ -146,78 +171,89 @@ class WeatherModule(BaseModule):
                 business_key=self._sample_key(sample.payload["time"]),
             )
             if sample.id == expected.id:
-                return sample
+                return Observation.model_validate(sample.payload)
         return None
 
     async def _raw_sensor_summary(self):
         sample = await self._latest_sample()
         if sample is None:
-            return "等待首次天气观测"
-        at = datetime.fromtimestamp(
-            sample.payload.get("time", sample.created_at), ZoneInfo(self.settings.bot_timezone)
+            return "等待首次天气查询"
+        if not sample.fresh_at(self.world.clock()):
+            return "上次天气数据已过期，可按需查询"
+        return "最近查询：" + sample.describe(self.settings.bot_timezone)
+
+    def _result(self, sample: Observation, reason: str) -> Outcome:
+        return Outcome(
+            "done",
+            reason,
+            {
+                "observation": sample.model_dump(exclude_none=True),
+                "summary": sample.describe(self.settings.bot_timezone),
+                "source": "Open-Meteo",
+            },
         )
-        temperature = sample.payload["temperature_2m"]
-        code = sample.payload["weather_code"]
-        return f"最近天气 {at:%m-%d %H:%M}，{temperature} °C，天气代码 {code}"
 
     async def read(self, call: ActionCall) -> Outcome:
-        if reason := self.inactive_reason:
-            return Outcome("gated_skip", reason)
         place, revision = self.location, self._revision
-        local = datetime.fromtimestamp(call.now, ZoneInfo(self.settings.bot_timezone))
-        hour_start = local.replace(minute=0, second=0, microsecond=0).timestamp()
-        latest = await self._latest_sample()
-        if latest and hour_start <= latest.created_at <= call.now:
-            return Outcome("done", "observation_cached")
-        try:
-            response = await self.http.get(
-                "https://api.open-meteo.com/v1/forecast",
-                params={
-                    "latitude": place.latitude,
-                    "longitude": place.longitude,
-                    "current": self.current_fields,
-                    "timeformat": "unixtime",
-                },
-                follow_redirects=False,
-                timeout=5,
-            )
-            response.raise_for_status()
-            observed = Observation.model_validate(response.json()["current"])
-        except (httpx.HTTPError, ValueError, KeyError, TypeError):
-            return Outcome("gated_skip", "weather_unavailable")
-        if not 0 <= call.now - observed.time < 3600:
-            return Outcome("gated_skip", "weather_stale")
-        async with self._location_lock:
-            if revision != self._revision:
-                return Outcome("gated_skip", "weather_location_changed")
-            if self.inactive_reason or not call.still_allowed():
-                return Outcome("gated_skip", "action_no_longer_eligible")
-            await self.world.publish_event(
-                self.module_id,
-                "weather_observed",
-                observed.model_dump(exclude_none=True),
-                importance="low",
-                now=call.now,
-                business_key=self._sample_key(observed.time),
-                include_in_plan=False,
-            )
-        return Outcome("done", "observation_recorded")
+        loop = asyncio.get_running_loop()
+        started = loop.time()
 
-    async def daily_report(self, call: ActionCall) -> Outcome:
-        async with self._location_lock:
-            if reason := self.inactive_reason:
-                return Outcome("gated_skip", reason)
-            sample = await self._latest_sample()
-            if sample is None or not 0 <= call.now - sample.payload["time"] < 3600:
-                # At the top of the hour both timers can become due together.
-                return Outcome("not_dispatched", "awaiting_weather_sample")
-            day = datetime.fromtimestamp(call.now, ZoneInfo(self.settings.bot_timezone)).date()
-            await self.world.publish_event(
-                self.module_id,
-                "weather_report_due",
-                sample.payload,
-                now=call.now,
-                business_key=str(day),
-                include_in_plan=False,
+        def now():
+            return call.now + (loop.time() - started)
+
+        def issue():
+            if revision != self._revision:
+                return "weather_location_changed"
+            return self.inactive_reason or (
+                None if call.still_allowed() else "action_no_longer_eligible"
             )
-        return Outcome("done", "weather_report_ready")
+
+        async with self._read_lock:
+            if reason := issue():
+                return Outcome("gated_skip", reason)
+            latest = await self._latest_sample()
+            if reason := issue():
+                return Outcome("gated_skip", reason)
+            if latest and latest.fresh_at(now()):
+                return self._result(latest, "observation_cached")
+            if self.http is None:
+                return Outcome("gated_skip", "weather_unavailable")
+            try:
+                data = await bounded_json(
+                    self.http,
+                    "GET",
+                    "https://api.open-meteo.com/v1/forecast",
+                    params={
+                        "latitude": place.latitude,
+                        "longitude": place.longitude,
+                        "current": self.current_fields,
+                        "timeformat": "unixtime",
+                    },
+                    follow_redirects=False,
+                    timeout=5,
+                    max_bytes=16_384,
+                )
+                observed = Observation.model_validate(data["current"])
+            except (httpx.HTTPError, ValueError, KeyError, TypeError, Rejected):
+                return Outcome("gated_skip", "weather_unavailable")
+            if not observed.fresh_at(now()):
+                return Outcome("gated_skip", "weather_stale")
+            async with self._location_lock, self.world.store.transaction():
+                if reason := issue():
+                    return Outcome("gated_skip", reason)
+                event = self.world.make_event(
+                    self.module_id,
+                    "weather_observed",
+                    observed.model_dump(exclude_none=True),
+                    importance="low",
+                    now=call.now,
+                    business_key=self._sample_key(observed.time),
+                )
+                event.consumed = True
+                event, created = await self.world.insert_event_tx(event)
+        # Subscribers can call this query again, after the observation is committed.
+        if created:
+            await self.world.notify_event(event)
+        if reason := issue():
+            return Outcome("gated_skip", reason)
+        return self._result(observed, "observation_recorded")
