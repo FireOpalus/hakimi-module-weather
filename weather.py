@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -35,6 +36,8 @@ class WeatherScheduleOptions(ScheduleOptions):
 
 class WeatherModule(BaseModule):
     module_id = "weather"
+    display_name = "天气观测"
+    description = "观测地点、每小时天气与每日提醒"
     schedule_options = WeatherScheduleOptions
     current_fields = "temperature_2m,weather_code,precipitation,shortwave_radiation,is_day"
 
@@ -56,6 +59,9 @@ class WeatherModule(BaseModule):
     def location(self) -> Coordinates | None:
         return self._override or self._env_location
 
+    def admin_status(self, request):
+        return {"location": self.location_status()}
+
     def location_status(self):
         if self._override:
             return self._override.model_dump()
@@ -73,6 +79,11 @@ class WeatherModule(BaseModule):
                 WeatherLocation.model_validate(saved["place"]) if saved["place"] else None
             )
             self._revision = saved["revision"]
+
+    @asynccontextmanager
+    async def lifespan(self):
+        await self.load_location()
+        yield
 
     async def set_location(self, place: WeatherLocation | None) -> None:
         async with self._location_lock:
