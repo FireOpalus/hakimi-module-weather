@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
+from ipaddress import IPv4Address
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -193,6 +194,57 @@ class WeatherModule(BaseModule):
             },
         )
 
+    async def _current(self, place: Coordinates, issue):
+        host = "api.open-meteo.com"
+        options = {
+            "params": {
+                "latitude": place.latitude,
+                "longitude": place.longitude,
+                "current": self.current_fields,
+                "timeformat": "unixtime",
+            },
+            "timeout": 5,
+            "max_bytes": 16_384,
+            "follow_redirects": False,
+        }
+        try:
+            return await bounded_json(self.http, "GET", f"https://{host}/v1/forecast", **options)
+        except httpx.ConnectTimeout:
+            # Seoul's default GeoDNS edge can stall before TLS. Resolve only the fixed
+            # provider name, then verify TLS against that same name on one alternate edge.
+            if reason := issue():
+                raise Rejected(reason) from None
+            dns = await bounded_json(
+                self.http,
+                "GET",
+                "https://dns.google/resolve",
+                params={"name": host, "type": "A", "edns_client_subnet": "0.0.0.0/0"},
+                timeout=3,
+                max_bytes=4096,
+                follow_redirects=False,
+            )
+        if dns.get("Status") == 0:
+            for answer in dns.get("Answer", []):
+                if (
+                    not isinstance(answer, dict)
+                    or answer.get("type") != 1
+                    or answer.get("name") not in (host, host + ".")
+                ):
+                    continue
+                address = IPv4Address(answer["data"])
+                if address.is_global and not address.is_multicast:
+                    if reason := issue():
+                        raise Rejected(reason)
+                    return await bounded_json(
+                        self.http,
+                        "GET",
+                        f"https://{address}/v1/forecast",
+                        headers={"Host": host, "Connection": "close"},
+                        extensions={"sni_hostname": host},
+                        **options,
+                    )
+        raise Rejected("weather_unavailable")
+
     async def read(self, call: ActionCall) -> Outcome:
         place, revision = self.location, self._revision
         loop = asyncio.get_running_loop()
@@ -219,23 +271,10 @@ class WeatherModule(BaseModule):
             if self.http is None:
                 return Outcome("gated_skip", "weather_unavailable")
             try:
-                data = await bounded_json(
-                    self.http,
-                    "GET",
-                    "https://api.open-meteo.com/v1/forecast",
-                    params={
-                        "latitude": place.latitude,
-                        "longitude": place.longitude,
-                        "current": self.current_fields,
-                        "timeformat": "unixtime",
-                    },
-                    follow_redirects=False,
-                    timeout=5,
-                    max_bytes=16_384,
-                )
+                data = await self._current(place, issue)
                 observed = Observation.model_validate(data["current"])
             except (httpx.HTTPError, ValueError, KeyError, TypeError, Rejected):
-                return Outcome("gated_skip", "weather_unavailable")
+                return Outcome("gated_skip", issue() or "weather_unavailable")
             if not observed.fresh_at(now()):
                 return Outcome("gated_skip", "weather_stale")
             async with self._location_lock, self.world.store.transaction():
