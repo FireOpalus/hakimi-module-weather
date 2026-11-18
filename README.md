@@ -6,7 +6,7 @@
 
 在模块内调用 `result = await service.life_engine.query("weather.read")`。当 `result.status == "done"` 时，`result.details` 包含 `observation`、可读的 `summary` 和 `source`。后台通过受鉴权的 `GET /admin/api/life/modules/weather/current` 取得同样的数据。观测时间是 Unix 秒，气温为 °C，降水为采样区间的毫米数，短波辐射为 W/m²。相同地点的并发查询共用有效观测，超过上游给出的区间后由下次调用更新。
 
-遇到连接超时，服务会向 Google 公共 DNS 查询 Open-Meteo 的域名，再向同一官方域名的一个公开节点重试一次。地点只发送给天气服务；备用连接同样校验原域名的 HTTPS 证书。
+遇到连接超时，服务会用固定的欧洲区域提示向 Google 公共 DNS 查询 Open-Meteo 的域名，再向同一官方域名的一个公开节点重试一次。地点只发送给天气服务；备用连接同样校验原域名的 HTTPS 证书。
 
 城市搜索使用 Open-Meteo，地名数据由 GeoNames 提供。IP 定位只在管理员请求时执行，识别结果可能与实际城市有偏差。公开天气事件只包含观测值。[Open-Meteo Geocoding](https://open-meteo.com/en/docs/geocoding-api) · [GeoNames](https://www.geonames.org/) · [IPWhois](https://ipwhois.io/documentation)
 

@@ -211,14 +211,15 @@ class WeatherModule(BaseModule):
             return await bounded_json(self.http, "GET", f"https://{host}/v1/forecast", **options)
         except httpx.ConnectTimeout:
             # Seoul's default GeoDNS edge can stall before TLS. Resolve only the fixed
-            # provider name, then verify TLS against that same name on one alternate edge.
+            # provider name with a fixed European GeoDNS hint (never the observer's address).
+            # A resolver without a region hint may return the same unreachable edge.
             if reason := issue():
                 raise Rejected(reason) from None
             dns = await bounded_json(
                 self.http,
                 "GET",
                 "https://dns.google/resolve",
-                params={"name": host, "type": "A", "edns_client_subnet": "0.0.0.0/0"},
+                params={"name": host, "type": "A", "edns_client_subnet": "193.0.0.0/24"},
                 timeout=3,
                 max_bytes=4096,
                 follow_redirects=False,
