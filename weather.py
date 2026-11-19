@@ -154,7 +154,10 @@ class WeatherModule(BaseModule):
         return (
             Action(
                 name="weather.read",
-                description="按需查询已设地点（你那边）的当前天气、气温与降水。仅用于当地实况，不提供异地或未来预报。",
+                description=(
+                    "查询哈基米已设地点的当前实况天气、气温与降水"
+                    "（用于回答“你那边下雨了吗/今天冷不冷/外面天气咋样”；不查异地城市或未来多日预报）"
+                ),
                 origins=frozenset({"planner", "query"}),
                 run=self.read,
             ),
