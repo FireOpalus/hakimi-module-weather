@@ -70,6 +70,7 @@ class Observation(BaseModel):
 
 class WeatherModule(BaseModule):
     module_id = "weather"
+    admin_panel = "weather"
     display_name = "天气观测"
     description = "AI 和其他模块可按需查询已设地点的当前天气"
     current_fields = "temperature_2m,weather_code,precipitation,shortwave_radiation,is_day"
